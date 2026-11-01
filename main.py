@@ -50,6 +50,8 @@ def check_github_pages(domain):
     Checks if a CNAME record points to an inactive Github Pages site.
     """
     try:
+        # The service checks go over plain HTTP. A host that answers only on HTTPS, or that
+        # redirects HTTP somewhere unrelated, can read as missing when it is alive and claimed.
         response = requests.get(f"http://{domain}", timeout=5)
         if response.status_code == 404:
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -106,6 +108,9 @@ def resolve_cname(domain):
         return None
     except Exception as e:
         raise RuntimeError(f"CNAME lookup failed for {domain}: {e}")
+    # Only the first answer is ever examined, and if that one equals the name itself I return
+    # at once from inside the loop. A real target sitting later in the same answer set is
+    # never seen.
     for answer in answers:
         target = str(answer.target).rstrip(".")
         if target and target.lower() != domain.lower():
@@ -117,10 +122,15 @@ def check_subdomain_takeover(domain):
      """
      Orchestrates the subdomain takeover checks for various services.
      """
+     # I check exactly the one name I am given. There is no subdomain enumeration anywhere in
+     # this file, so the long tail of names is covered only if a caller feeds them in one by one.
      cname = resolve_cname(domain)
 
      if cname:
          logging.info(f"CNAME record found: {domain} -> {cname}")
+         # The service tests are substring matches over the whole target. A host that merely
+         # contains the text, like an s3 lookalike under someone else's domain, is routed to
+         # the S3 check as if it were Amazon's own host.
          if "s3.amazonaws.com" in cname:
              return check_s3_bucket(cname)
          elif "github.io" in cname:
@@ -163,6 +173,8 @@ def main():
             logging.info(f"Potential subdomain takeover vulnerability found for: {domain_to_scan}")
             if args.output:
                 try:
+                    # Append mode means a rerun adds fresh lines under stale ones, and nothing written
+                    # to the file says which run a line came from.
                     with open(args.output, "a") as f:
                         f.write(f"Potential subdomain takeover vulnerability found for: {domain_to_scan}\n")
                 except Exception as e:
