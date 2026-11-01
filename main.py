@@ -1,8 +1,14 @@
 import argparse
 import logging
 import requests
-import socket
+import sys
 from bs4 import BeautifulSoup
+
+try:
+    import dns.resolver
+    import dns.exception
+except ImportError:
+    dns = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,24 +23,27 @@ def setup_argparse():
     parser.add_argument("-o", "--output", help="Output file to save results.")
     return parser
 
-def check_s3_bucket(domain):
+def check_s3_bucket(target):
     """
-    Checks if a CNAME record points to an inactive AWS S3 bucket.
+    Checks the S3 host named by the CNAME target. The target already
+    names the service host, so no suffix is built from the supplied domain.
+    Returns True, False, or None when the check could not be carried out.
     """
+    url = f"http://{target}"
     try:
-        response = requests.get(f"http://{domain}.s3.amazonaws.com", timeout=5)
+        response = requests.get(url, timeout=5)
         if response.status_code == 404 and "NoSuchBucket" in response.text:
-            logging.warning(f"[POTENTIAL TAKEOVER] S3 Bucket {domain} not found or not accessible. Potential takeover: http://{domain}.s3.amazonaws.com")
+            logging.warning(f"[POTENTIAL TAKEOVER] S3 Bucket {target} not found or not accessible. Potential takeover: {url}")
             return True
         elif response.status_code == 403 and "AccessDenied" in response.text:
-            logging.info(f"S3 Bucket {domain} exists but access is denied. Investigate manually.")
+            logging.info(f"S3 Bucket {target} exists but access is denied. Investigate manually.")
             return False
         else:
-            logging.debug(f"S3 Bucket {domain}: Status Code {response.status_code}, Text: {response.text}")
+            logging.debug(f"S3 Bucket {target}: Status Code {response.status_code}, Marker: NoSuchBucket not matched")
             return False
     except requests.exceptions.RequestException as e:
-        logging.debug(f"Error checking S3 Bucket {domain}: {e}")
-        return False
+        logging.debug(f"Error checking S3 Bucket {target}: {e}")
+        return None
 
 def check_github_pages(domain):
     """
@@ -47,42 +56,62 @@ def check_github_pages(domain):
             if soup.find(string=lambda text: "There isn't a GitHub Pages site here." in text if text else False): # Handle NoneType text
                 logging.warning(f"[POTENTIAL TAKEOVER] GitHub Pages site {domain} not found. Potential takeover: http://{domain}")
                 return True
+            logging.debug(f"Github Pages {domain}: Status Code {response.status_code}, Marker: GitHub Pages missing site text not matched")
+            return False
         else:
-             logging.debug(f"Github Pages {domain}: Status Code {response.status_code}, Text: {response.text}")
+             logging.debug(f"Github Pages {domain}: Status Code {response.status_code}, Marker: GitHub Pages missing site text not matched")
              return False
     except requests.exceptions.RequestException as e:
         logging.debug(f"Error checking Github Pages {domain}: {e}")
-        return False
+        return None
 
-def check_azure_storage(domain):
+def check_azure_storage(target):
     """
-    Checks if a CNAME record points to an inactive Azure Storage account.
+    Checks the Azure host named by the CNAME target. Returns True, False,
+    or None when the check could not be carried out.
     """
+    url = f"http://{target}"
     try:
-        response = requests.get(f"http://{domain}.blob.core.windows.net", timeout=5)
+        response = requests.get(url, timeout=5)
         if response.status_code == 404:
             soup = BeautifulSoup(response.text, 'html.parser')
-            if soup.find("Code", text="ResourceNotFound"): # Check specifically for ResourceNotFound
-                logging.warning(f"[POTENTIAL TAKEOVER] Azure Storage account {domain} not found. Potential takeover: http://{domain}.blob.core.windows.net")
+            if soup.find("Code", text="ResourceNotFound"):
+                logging.warning(f"[POTENTIAL TAKEOVER] Azure Storage account {target} not found. Potential takeover: {url}")
                 return True
+            logging.debug(f"Azure Storage {target}: Status Code {response.status_code}, Marker: ResourceNotFound not matched")
+            return False
         else:
-            logging.debug(f"Azure Storage {domain}: Status Code {response.status_code}, Text: {response.text}")
+            logging.debug(f"Azure Storage {target}: Status Code {response.status_code}, Marker: ResourceNotFound not matched")
             return False
 
     except requests.exceptions.RequestException as e:
-        logging.debug(f"Error checking Azure Storage {domain}: {e}")
-        return False
+        logging.debug(f"Error checking Azure Storage {target}: {e}")
+        return None
 
 
 def resolve_cname(domain):
     """
-    Resolves a CNAME record for a given domain. Returns None if no CNAME record is found.
+    Performs a real DNS CNAME lookup with dnspython. Returns the CNAME
+    target, or None when the name has no CNAME record. A name is never
+    treated as its own CNAME. Raises RuntimeError when the lookup itself
+    could not be carried out.
     """
+    if dns is None:
+        raise RuntimeError("dnspython is not installed, so no CNAME lookup can be performed")
     try:
-        cname = socket.getaddrinfo(domain, None, socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, socket.AI_CANONNAME)[0][3]
-        return cname
-    except socket.gaierror:
+        answers = dns.resolver.resolve(domain, "CNAME")
+    except dns.resolver.NoAnswer:
         return None
+    except dns.resolver.NXDOMAIN:
+        return None
+    except Exception as e:
+        raise RuntimeError(f"CNAME lookup failed for {domain}: {e}")
+    for answer in answers:
+        target = str(answer.target).rstrip(".")
+        if target and target.lower() != domain.lower():
+            return target
+        return None
+    return None
 
 def check_subdomain_takeover(domain):
      """
@@ -93,11 +122,11 @@ def check_subdomain_takeover(domain):
      if cname:
          logging.info(f"CNAME record found: {domain} -> {cname}")
          if "s3.amazonaws.com" in cname:
-             return check_s3_bucket(domain)
+             return check_s3_bucket(cname)
          elif "github.io" in cname:
              return check_github_pages(domain)
          elif "blob.core.windows.net" in cname:
-             return check_azure_storage(domain)
+             return check_azure_storage(cname)
          else:
              logging.info(f"CNAME record points to an unsupported service: {cname}")
              return False
@@ -119,12 +148,16 @@ def main():
 
     if not domain_to_scan:
         logging.error("Please provide a domain to scan.")
-        return
+        sys.exit(1)
 
     logging.info(f"Starting subdomain takeover scan for: {domain_to_scan}")
 
     try:
         takeover_vulnerable = check_subdomain_takeover(domain_to_scan)
+
+        if takeover_vulnerable is None:
+            logging.error(f"Subdomain takeover scan inconclusive for: {domain_to_scan}: a check could not be carried out.")
+            sys.exit(1)
 
         if takeover_vulnerable:
             logging.info(f"Potential subdomain takeover vulnerability found for: {domain_to_scan}")
@@ -138,8 +171,11 @@ def main():
         else:
             logging.info(f"No subdomain takeover vulnerability found for: {domain_to_scan}")
 
+    except SystemExit:
+        raise
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
+        sys.exit(1)
 
     logging.info("Subdomain takeover scan complete.")
 
