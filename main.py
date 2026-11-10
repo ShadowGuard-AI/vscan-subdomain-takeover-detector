@@ -2,7 +2,11 @@ import argparse
 import logging
 import requests
 import sys
-from bs4 import BeautifulSoup
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 try:
     import dns.resolver
@@ -49,6 +53,9 @@ def check_github_pages(domain):
     """
     Checks if a CNAME record points to an inactive Github Pages site.
     """
+    if BeautifulSoup is None:
+        logging.debug("beautifulsoup4 is not installed, so the GitHub Pages check cannot be carried out")
+        return None
     try:
         # The service checks go over plain HTTP. A host that answers only on HTTPS, or that
         # redirects HTTP somewhere unrelated, can read as missing when it is alive and claimed.
@@ -72,6 +79,9 @@ def check_azure_storage(target):
     Checks the Azure host named by the CNAME target. Returns True, False,
     or None when the check could not be carried out.
     """
+    if BeautifulSoup is None:
+        logging.debug("beautifulsoup4 is not installed, so the Azure check cannot be carried out")
+        return None
     url = f"http://{target}"
     try:
         response = requests.get(url, timeout=5)
@@ -108,15 +118,17 @@ def resolve_cname(domain):
         return None
     except Exception as e:
         raise RuntimeError(f"CNAME lookup failed for {domain}: {e}")
-    # Only the first answer is ever examined, and if that one equals the name itself I return
-    # at once from inside the loop. A real target sitting later in the same answer set is
-    # never seen.
     for answer in answers:
         target = str(answer.target).rstrip(".")
         if target and target.lower() != domain.lower():
             return target
-        return None
     return None
+
+
+def _targets_service(cname, suffix):
+    """True when the CNAME target is the service host or a true subdomain of it."""
+    host = cname.lower().rstrip(".")
+    return host == suffix or host.endswith("." + suffix)
 
 def check_subdomain_takeover(domain):
      """
@@ -128,14 +140,11 @@ def check_subdomain_takeover(domain):
 
      if cname:
          logging.info(f"CNAME record found: {domain} -> {cname}")
-         # The service tests are substring matches over the whole target. A host that merely
-         # contains the text, like an s3 lookalike under someone else's domain, is routed to
-         # the S3 check as if it were Amazon's own host.
-         if "s3.amazonaws.com" in cname:
+         if _targets_service(cname, "s3.amazonaws.com"):
              return check_s3_bucket(cname)
-         elif "github.io" in cname:
+         elif _targets_service(cname, "github.io"):
              return check_github_pages(domain)
-         elif "blob.core.windows.net" in cname:
+         elif _targets_service(cname, "blob.core.windows.net"):
              return check_azure_storage(cname)
          else:
              logging.info(f"CNAME record points to an unsupported service: {cname}")
@@ -173,9 +182,7 @@ def main():
             logging.info(f"Potential subdomain takeover vulnerability found for: {domain_to_scan}")
             if args.output:
                 try:
-                    # Append mode means a rerun adds fresh lines under stale ones, and nothing written
-                    # to the file says which run a line came from.
-                    with open(args.output, "a") as f:
+                    with open(args.output, "w") as f:
                         f.write(f"Potential subdomain takeover vulnerability found for: {domain_to_scan}\n")
                 except Exception as e:
                     logging.error(f"Error writing to output file: {e}")
